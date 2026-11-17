@@ -1,164 +1,237 @@
 /**
- * tests.js : démonstrations à montrer au correcteur
- *   1. les validateurs refusent bien les documents invalides
- *   2. la vente atomique empêche la survente
- *   3. comparaison explain() avant / après indexation
- *   4. pipelines d'agrégation du tableau de bord
- *
- * Usage : mongosh "<URI>" db/tests.js   (après db/init.js)
+ * Démonstrations MongoDB : validations, vente atomique, index et agrégations.
+ * Usage : mongosh "<URI>" db/tests.js (après db/init.js)
  */
 const fdb = db.getSiblingDB("festival_live");
 
-// ===========================================================================
-// 1. Validateurs : chaque insertion ci-dessous DOIT être refusée
-// ===========================================================================
-print("\n=== 1. Validateurs $jsonSchema ===");
-function expectRejected(label, fn) {
-  try { fn(); print("  ✘ ACCEPTÉ (anormal) : " + label); }
-  catch (e) { print(`  ✔ refusé : ${label}  [code ${e.code}]`); }
-}
-const tpl = fdb.concerts.findOne({ status: "on_sale" });
-delete tpl._id;
-expectRejected("statut inconnu", () => fdb.concerts.insertOne({ ...tpl, status: "foo" }));
-expectRejected("prix négatif", () => fdb.concerts.insertOne({ ...tpl, prices: [{ category: "standard", price: -5 }] }));
-expectRejected("catégorie de billet inconnue", () => fdb.concerts.insertOne({ ...tpl, prices: [{ category: "gratuit", price: 0 }] }));
-expectRejected("ticketsSold > capacity", () => fdb.concerts.insertOne({ ...tpl, ticketsSold: tpl.capacity + 1 }));
-expectRejected("fin avant début", () => fdb.concerts.insertOne({ ...tpl, endAt: new Date(tpl.startAt.getTime() - 1000) }));
-expectRejected("date en chaîne de caractères", () => fdb.concerts.insertOne({ ...tpl, startAt: "2027-07-09" }));
-expectRejected("champ inconnu", () => fdb.concerts.insertOne({ ...tpl, foo: 1 }));
-expectRejected("champ obligatoire manquant", () => { const x = { ...tpl }; delete x.stageId; fdb.concerts.insertOne(x); });
-expectRejected("genre d'artiste inconnu", () => fdb.artists.insertOne({ name: "X", genres: ["schlager"], country: "FR", createdAt: new Date() }));
-expectRejected("capacité de scène négative", () => fdb.stages.insertOne({ name: "Test", capacity: -3, type: "indoor" }));
-const tk = fdb.tickets.findOne(); delete tk._id;
-expectRejected("code de billet dupliqué (index unique)", () => fdb.tickets.insertOne(tk));
-expectRejected("email acheteur invalide", () => fdb.tickets.insertOne({ ...tk, code: "FL-ZZZZZZZZ", buyer: { ...tk.buyer, email: "pas-un-email" } }));
+print("\n=== 0. Une seule collection ===");
+const collectionNames = fdb.getCollectionNames();
+if (collectionNames.length !== 1) throw new Error("La base doit contenir une seule collection");
+if (collectionNames[0] !== "concerts") throw new Error("La collection attendue est concerts");
+print("  concerts contient les concerts, artistes, scènes et billets");
 
-// ===========================================================================
-// 2. Vente atomique : la condition de capacité est DANS le filtre de l'update,
-//    donc deux ventes simultanées ne peuvent pas dépasser la capacité
-//    (pas besoin de transaction -> fonctionne aussi sur un MongoDB local standalone).
-// ===========================================================================
+print("\n=== 1. Validations $jsonSchema ===");
+function expectRejected(label, fn) {
+  let rejected = false;
+  try {
+    fn();
+  } catch (e) {
+    rejected = true;
+    print(`  ✔ refusé : ${label} [code ${e.code}]`);
+  }
+  if (!rejected) throw new Error("Document invalide accepté : " + label);
+}
+
+const tpl = fdb.concerts.findOne({ status: "on_sale" });
+const emptyConcert = { ...tpl, tickets: [], ticketsSold: 0 };
+delete emptyConcert._id;
+expectRejected("statut inconnu", () => fdb.concerts.insertOne({ ...emptyConcert, status: "foo" }));
+expectRejected("prix négatif", () => fdb.concerts.insertOne({ ...emptyConcert, prices: [{ category: "standard", price: -5 }] }));
+expectRejected("catégorie de billet inconnue", () => fdb.concerts.insertOne({ ...emptyConcert, prices: [{ category: "gratuit", price: 0 }] }));
+expectRejected("ticketsSold supérieur à la capacité", () => fdb.concerts.insertOne({ ...emptyConcert, ticketsSold: emptyConcert.capacity + 1 }));
+expectRejected("fin avant début", () => fdb.concerts.insertOne({ ...emptyConcert, endAt: new Date(emptyConcert.startAt.getTime() - 1000) }));
+expectRejected("date en chaîne de caractères", () => fdb.concerts.insertOne({ ...emptyConcert, startAt: "2027-07-09" }));
+expectRejected("champ inconnu", () => fdb.concerts.insertOne({ ...emptyConcert, foo: 1 }));
+expectRejected("capacité de scène négative", () => fdb.concerts.insertOne({
+  ...emptyConcert,
+  stage: { ...emptyConcert.stage, capacity: -3 }
+}));
+expectRejected("genre d'artiste inconnu", () => fdb.concerts.insertOne({
+  ...emptyConcert,
+  artist: { ...emptyConcert.artist, genres: ["schlager"] }
+}));
+
+const invalidEmailTicket = {
+  code: "FL-INVALID1",
+  buyer: { firstName: "Test", lastName: "Demo", email: "pas-un-email" },
+  category: "standard",
+  price: 10,
+  purchasedAt: new Date(),
+  status: "valid"
+};
+expectRejected("email acheteur invalide", () => fdb.concerts.insertOne({
+  ...emptyConcert,
+  tickets: [invalidEmailTicket],
+  ticketsSold: 1
+}));
+
+const ticketSource = fdb.concerts.findOne({ "tickets.0": { $exists: true } });
+const duplicateCodeConcert = { ...ticketSource };
+delete duplicateCodeConcert._id;
+expectRejected("code de billet déjà utilisé dans un autre concert", () => fdb.concerts.insertOne(duplicateCodeConcert));
+
 print("\n=== 2. Vente atomique / capacité ===");
-const randomCode = () => "FL-" + Array.from({ length: 8 }, () => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[Math.floor(Math.random() * 32)]).join("");
+const randomCode = () => "FL-" + Array.from(
+  { length: 8 },
+  () => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[Math.floor(Math.random() * 32)]
+).join("");
 
 function sellTicket(concertId, buyer, category) {
   const concert = fdb.concerts.findOne({ _id: concertId });
   if (!concert) return { ok: false, http: 404, error: "concert introuvable" };
-  const tarif = concert.prices.find(p => p.category === category);
+  const tarif = concert.prices.find(price => price.category === category);
   if (!tarif) return { ok: false, http: 400, error: "catégorie inconnue pour ce concert" };
 
-  // 1) Réservation atomique d'une place
-  const r = fdb.concerts.updateOne(
-    { _id: concertId, status: "on_sale", $expr: { $lt: ["$ticketsSold", "$capacity"] } },
-    { $inc: { ticketsSold: 1 } }
+  const ticket = {
+    code: randomCode(),
+    buyer,
+    category,
+    price: tarif.price,
+    purchasedAt: new Date(),
+    status: "valid"
+  };
+  const result = fdb.concerts.updateOne(
+    {
+      _id: concertId,
+      status: "on_sale",
+      tickets: { $not: { $elemMatch: { code: ticket.code } } },
+      $expr: { $lt: ["$ticketsSold", "$capacity"] }
+    },
+    { $inc: { ticketsSold: 1 }, $push: { tickets: ticket } }
   );
-  if (r.modifiedCount === 0) return { ok: false, http: 409, error: "concert complet ou vente fermée" };
+  if (result.modifiedCount === 0) return { ok: false, http: 409, error: "concert complet ou vente fermée" };
 
-  // 2) Création du billet (compensation si l'insertion échoue)
-  const ticket = { concertId, code: randomCode(), buyer, category, price: tarif.price, purchasedAt: new Date(), status: "valid" };
-  try { fdb.tickets.insertOne(ticket); }
-  catch (e) { fdb.concerts.updateOne({ _id: concertId }, { $inc: { ticketsSold: -1 } }); throw e; }
-
-  // 3) Dernière place vendue -> sold_out
-  fdb.concerts.updateOne({ _id: concertId, status: "on_sale", $expr: { $gte: ["$ticketsSold", "$capacity"] } }, { $set: { status: "sold_out" } });
+  fdb.concerts.updateOne(
+    { _id: concertId, status: "on_sale", $expr: { $gte: ["$ticketsSold", "$capacity"] } },
+    { $set: { status: "sold_out" } }
+  );
   return { ok: true, http: 201, code: ticket.code };
 }
 
-// Concert de test à 2 places
-const testConcert = { ...tpl, capacity: 2, ticketsSold: 0, status: "on_sale" };
+const testConcert = {
+  ...emptyConcert,
+  capacity: 2,
+  stage: { ...emptyConcert.stage, capacity: 2 },
+  ticketsSold: 0,
+  tickets: [],
+  status: "on_sale"
+};
 const testId = fdb.concerts.insertOne(testConcert).insertedId;
 const buyer = { firstName: "Test", lastName: "Demo", email: "test@example.com" };
-[1, 2, 3].forEach(n => print(`  vente n°${n} (capacité 2) :`, JSON.stringify(sellTicket(testId, buyer, "standard"))));
-print("  statut final du concert de test :", fdb.concerts.findOne({ _id: testId }).status);
-fdb.tickets.deleteMany({ concertId: testId });
-fdb.concerts.deleteOne({ _id: testId });                       // nettoyage
-
-// ===========================================================================
-// 3. explain() avant / après indexation
-// ===========================================================================
-print("\n=== 3. explain() : avant / après index ===");
-function plan(label, cursor) {
-  const e = cursor.explain("executionStats"), s = e.executionStats;
-  const strat = JSON.stringify(e.queryPlanner.winningPlan).includes("COLLSCAN") ? "COLLSCAN" : "IXSCAN ";
-  print(`  ${label.padEnd(8)} ${strat} | docs examinés=${String(s.totalDocsExamined).padStart(5)} | clés examinées=${String(s.totalKeysExamined).padStart(4)} | retournés=${String(s.nReturned).padStart(4)} | ${s.executionTimeMillis} ms`);
+try {
+  const firstSale = sellTicket(testId, buyer, "standard");
+  const secondSale = sellTicket(testId, buyer, "standard");
+  const thirdSale = sellTicket(testId, buyer, "standard");
+  print("  ventes 1 et 2 :", JSON.stringify(firstSale), JSON.stringify(secondSale));
+  print("  vente 3 (capacité atteinte) :", JSON.stringify(thirdSale));
+  const soldConcert = fdb.concerts.findOne({ _id: testId });
+  if (soldConcert.tickets.length !== 2) throw new Error("Deux billets doivent être intégrés au concert");
+  if (soldConcert.status !== "sold_out") throw new Error("Le concert doit être complet");
+  if (thirdSale.ok) throw new Error("La troisième vente doit être refusée");
+} finally {
+  fdb.concerts.deleteOne({ _id: testId });
 }
-const cid = fdb.concerts.findOne({ "artist.name": "Les Cratères" })._id;
-const email = fdb.tickets.findOne().buyer.email;
-const q1 = () => fdb.tickets.find({ concertId: cid, status: "used" });
-const q2 = () => fdb.tickets.find({ "buyer.email": email });
 
-fdb.tickets.dropIndex("idx_ticket_concert_status");
-fdb.tickets.dropIndex("idx_ticket_buyer_email");
-print(" Requête A : billets scannés d'un concert { concertId, status }");
-plan("AVANT", q1());
-print(" Requête B : billets d'un acheteur { buyer.email }");
-plan("AVANT", q2());
+print("\n=== 3. explain() avant / après index ===");
+function plan(label, cursor) {
+  const explain = cursor.explain("executionStats");
+  const stats = explain.executionStats;
+  const strategy = JSON.stringify(explain.queryPlanner.winningPlan).includes("COLLSCAN") ? "COLLSCAN" : "IXSCAN";
+  print(`  ${label.padEnd(8)} ${strategy} | documents examinés=${stats.totalDocsExamined} | clés examinées=${stats.totalKeysExamined} | retournés=${stats.nReturned} | ${stats.executionTimeMillis} ms`);
+}
 
-fdb.tickets.createIndex({ concertId: 1, status: 1 }, { name: "idx_ticket_concert_status" });
-fdb.tickets.createIndex({ "buyer.email": 1 }, { name: "idx_ticket_buyer_email" });
+const email = fdb.concerts.findOne({ "tickets.0": { $exists: true } }).tickets[0].buyer.email;
+const ticketsUsed = () => fdb.concerts.find({ "tickets.status": "used" });
+const ticketByEmail = () => fdb.concerts.find({ "tickets.buyer.email": email });
+fdb.concerts.dropIndex("idx_ticket_status");
+fdb.concerts.dropIndex("idx_ticket_buyer_email");
+print(" Requête A : concerts avec au moins un billet scanné");
+plan("AVANT", ticketsUsed());
+print(" Requête B : concert d'un acheteur { tickets.buyer.email }");
+plan("AVANT", ticketByEmail());
+
+fdb.concerts.createIndex({ "tickets.status": 1 }, { name: "idx_ticket_status" });
+fdb.concerts.createIndex({ "tickets.buyer.email": 1 }, { name: "idx_ticket_buyer_email" });
 print(" Après création des index :");
-plan("A APRÈS", q1());
-plan("B APRÈS", q2());
+plan("A APRÈS", ticketsUsed());
+plan("B APRÈS", ticketByEmail());
 
-// ===========================================================================
-// 4. Pipelines d'agrégation du tableau de bord (à reprendre dans l'API)
-// ===========================================================================
 print("\n=== 4. Tableau de bord ===");
-const countsRevenue = ["valid", "used"];                          // un billet annulé ne rapporte rien
+const revenueStatuses = ["valid", "used"];
 
-// 4.1 Recettes par jour et par scène : on groupe d'abord par concert (12 groupes),
-//     puis on joint concerts/scènes sur ces quelques groupes seulement.
 const recettesParJourEtScene = [
-  { $match: { status: { $in: countsRevenue } } },
-  { $group: { _id: "$concertId", revenue: { $sum: "$price" }, tickets: { $sum: 1 } } },
-  { $lookup: { from: "concerts", localField: "_id", foreignField: "_id", as: "c" } },
-  { $unwind: "$c" },
-  { $group: {
-      _id: { day: { $dateToString: { format: "%Y-%m-%d", date: "$c.startAt", timezone: "Europe/Paris" } }, stageId: "$c.stageId" },
-      revenue: { $sum: "$revenue" }, tickets: { $sum: "$tickets" } } },
-  { $lookup: { from: "stages", localField: "_id.stageId", foreignField: "_id", as: "stage" } },
-  { $unwind: "$stage" },
-  { $project: { _id: 0, day: "$_id.day", stage: "$stage.name", revenue: 1, tickets: 1 } },
+  { $unwind: "$tickets" },
+  { $match: { "tickets.status": { $in: revenueStatuses } } },
+  {
+    $group: {
+      _id: {
+        day: { $dateToString: { format: "%Y-%m-%d", date: "$startAt", timezone: "Europe/Paris" } },
+        stage: "$stage.name"
+      },
+      revenue: { $sum: "$tickets.price" },
+      tickets: { $sum: 1 }
+    }
+  },
+  { $project: { _id: 0, day: "$_id.day", stage: "$_id.stage", revenue: 1, tickets: 1 } },
   { $sort: { day: 1, stage: 1 } }
 ];
 print("-- Recettes par jour et par scène");
-fdb.tickets.aggregate(recettesParJourEtScene).forEach(d => printjson(d));
+fdb.concerts.aggregate(recettesParJourEtScene).forEach(printjson);
 
-// 4.2 Taux de remplissage par scène (concerts annulés exclus)
 const remplissageParScene = [
   { $match: { status: { $ne: "cancelled" } } },
-  { $group: { _id: "$stageId", sold: { $sum: "$ticketsSold" }, capacity: { $sum: "$capacity" } } },
-  { $lookup: { from: "stages", localField: "_id", foreignField: "_id", as: "stage" } },
-  { $unwind: "$stage" },
-  { $project: { _id: 0, stage: "$stage.name", sold: 1, capacity: 1,
-      fillRate: { $round: [{ $multiply: [{ $divide: ["$sold", "$capacity"] }, 100] }, 1] } } },
+  {
+    $group: {
+      _id: "$stage.name",
+      sold: { $sum: "$ticketsSold" },
+      capacity: { $sum: "$capacity" }
+    }
+  },
+  {
+    $project: {
+      _id: 0,
+      stage: "$_id",
+      sold: 1,
+      capacity: 1,
+      fillRate: { $round: [{ $multiply: [{ $divide: ["$sold", "$capacity"] }, 100] }, 1] }
+    }
+  },
   { $sort: { fillRate: -1 } }
 ];
 print("-- Taux de remplissage par scène (%)");
-fdb.concerts.aggregate(remplissageParScene).forEach(d => printjson(d));
+fdb.concerts.aggregate(remplissageParScene).forEach(printjson);
 
-// 4.3 Artistes ayant vendu le plus de billets
 const topArtistes = [
-  { $group: { _id: "$artist._id", artist: { $first: "$artist.name" }, tickets: { $sum: "$ticketsSold" } } },
-  { $sort: { tickets: -1 } }, { $limit: 5 },
+  {
+    $group: {
+      _id: "$artist._id",
+      artist: { $first: "$artist.name" },
+      tickets: { $sum: "$ticketsSold" }
+    }
+  },
+  { $sort: { tickets: -1 } },
+  { $limit: 5 },
   { $project: { _id: 0, artist: 1, tickets: 1 } }
 ];
 print("-- Top 5 artistes");
-fdb.concerts.aggregate(topArtistes).forEach(d => printjson(d));
+fdb.concerts.aggregate(topArtistes).forEach(printjson);
 
-// 4.4 Bonus : recettes par catégorie de billet
 const recettesParCategorie = [
-  { $match: { status: { $in: countsRevenue } } },
-  { $group: { _id: "$category", revenue: { $sum: "$price" }, tickets: { $sum: 1 } } },
+  { $unwind: "$tickets" },
+  { $match: { "tickets.status": { $in: revenueStatuses } } },
+  {
+    $group: {
+      _id: "$tickets.category",
+      revenue: { $sum: "$tickets.price" },
+      tickets: { $sum: 1 }
+    }
+  },
   { $sort: { revenue: -1 } }
 ];
 print("-- Recettes par catégorie de billet");
-fdb.tickets.aggregate(recettesParCategorie).forEach(d => printjson(d));
+fdb.concerts.aggregate(recettesParCategorie).forEach(printjson);
 
-// 4.5 Bonus : tendance des ventes par mois
 const tendanceVentes = [
-  { $group: { _id: { $dateToString: { format: "%Y-%m", date: "$purchasedAt" } }, tickets: { $sum: 1 }, revenue: { $sum: "$price" } } },
+  { $unwind: "$tickets" },
+  { $match: { "tickets.status": { $in: revenueStatuses } } },
+  {
+    $group: {
+      _id: { $dateToString: { format: "%Y-%m", date: "$tickets.purchasedAt" } },
+      tickets: { $sum: 1 },
+      revenue: { $sum: "$tickets.price" }
+    }
+  },
   { $sort: { _id: 1 } }
 ];
 print("-- Tendance des ventes par mois");
-fdb.tickets.aggregate(tendanceVentes).forEach(d => printjson(d));
+fdb.concerts.aggregate(tendanceVentes).forEach(printjson);

@@ -58,8 +58,21 @@ Angular CLI does not come with an end-to-end testing framework by default. You c
 
 For more information on using the Angular CLI, including detailed command references, visit the [Angular CLI Overview and Command Reference](https://angular.dev/tools/cli) page.
 
+## Base de données MongoDB
+
+La base `festival_live` utilise une seule collection, `concerts`. Chaque document
+contient les informations du concert et embarque aussi l'artiste, la scène et
+les billets correspondants. Les champs `ticketsSold` et `capacity` sont
+conservés pour les recherches et les contrôles de capacité; un validateur
+vérifie leur cohérence avec les billets et la capacité de la scène.
+
+Le script d'initialisation recrée le jeu de données et supprime les anciennes
+collections `artists`, `stages`, `concerts` et `tickets`. Les billets étant
+embarqués dans leur concert, leur nombre par document doit rester inférieur à
+la limite MongoDB de 16 Mo par document.
+
 ## Mongosh
 ```
 mongosh "mongodb://localhost:27017" db/init.js    # crée la base
-mongosh "<URI>" db/tests.js   
+mongosh "<URI>" db/tests.js                       # lance les démonstrations
 ```
